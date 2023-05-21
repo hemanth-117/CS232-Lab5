@@ -1,0 +1,178 @@
+#include "cache.h"
+
+#define SCORE_MAX 31
+#define ROUND_MAX 100
+#define BAD_SCORE 1
+#define OFF_SIZE 46
+#define TABLE_DEPTH 64
+#define Q_LEN 15
+#define DELAY 60
+
+class queue_entry{
+  public:
+    uint64_t addr_bits;
+    bool valid = 0;
+    uint16_t time;
+};
+
+class IP_TRACKER {
+  public:
+  uint32_t offset = 0;
+  uint32_t max_index = 0;
+  int32_t offset_list[OFF_SIZE] = {1,2,3,4,5,6,8,9,10,12,15,16,18,20,24,25,27,30,32,36,40,45,48,-1,-2,-3,-4,-5,-6,-8,-9,-10,-12,-15,-16,-18,-20,-24,-25,-27,-30,-32,-36,-40,-45,-48};  
+  uint32_t off_index = 0;
+  uint32_t offset_score[OFF_SIZE];
+  uint32_t round_no=0;
+  uint64_t rr_right[TABLE_DEPTH];
+  uint32_t right_last=0;
+  uint32_t left_last=0;
+  uint64_t rr_left[TABLE_DEPTH];
+  bool stat = 1;
+
+  queue_entry queue[Q_LEN];
+
+  bool check_rr(uint64_t addr){
+      uint32_t On = offset_list[off_index];
+      uint64_t a = (((addr >> LOG2_BLOCK_SIZE) - On));
+      for(int j=0;j<TABLE_DEPTH;j++){
+        if(a == rr_right[j] || a == rr_left[j] ){
+          return true;
+        }
+      }
+    return false;
+  }
+
+   uint32_t max_offset(){
+    uint32_t max = offset_score[0];
+    for(int i=1;i<OFF_SIZE;i++){
+      if(max < offset_score[i]){
+        max = offset_score[i];
+        max_index = i;
+      }
+    }
+    return max;
+  }
+
+  bool check_bad(uint32_t maxscore) { // CHECKING FOR BAD SCORE
+    if(maxscore <= BAD_SCORE) return true;
+    return false;
+  }
+
+  void refresh(uint64_t cpu) {
+    for(uint32_t i=0;i<Q_LEN;i++){ // DEQUEING OLD ELEMENTS FROM THE QUEUE
+      if(current_core_cycle[cpu]- queue[i].time >= DELAY && queue[i].valid == 1){
+        rr_left[left_last]= queue[i].addr_bits;
+        left_last = ( left_last +1 ) % TABLE_DEPTH; // UPDATING THE LAST POSITION OF LEFT TABLE
+        queue[i].valid = 0; // MAKING THE POSITION AVAILABLE 
+      }
+    }
+  }
+  void update(uint32_t cpu,uint64_t addr){
+    if(check_rr(addr)) { // CHECKING (X-On) IN RR TABLE
+        offset_score[off_index]++;
+    }
+    off_index++;
+    if(off_index == OFF_SIZE) {
+        round_no++;
+        off_index = 0;
+        uint32_t a = max_offset();
+        if(round_no == ROUND_MAX ||a >= SCORE_MAX) {
+            round_no = 0;
+            for(int i=0;i<OFF_SIZE;i++){
+              offset_score[i] = 0;
+            }
+            if(check_bad(a)) {
+                stat = 0;
+            }
+            else {
+                offset = offset_list[max_index];
+                stat = 1;
+            }
+        }
+    }
+    return;
+  }
+
+};
+
+IP_TRACKER tracker;
+
+void CACHE::l2c_prefetcher_initialize() 
+{
+  tracker.round_no =0;
+  for(int i=0;i<OFF_SIZE;i++){
+    tracker.offset_score[i]=0;
+  }
+  tracker.left_last=0;
+  tracker.right_last=0;
+}
+
+uint32_t CACHE::l2c_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint32_t metadata_in)
+{
+    tracker.refresh(cpu);
+   if(type!=LOAD) {
+    return metadata_in;
+   }
+  uint64_t set = get_set(addr >> LOG2_BLOCK_SIZE);
+  uint64_t way = get_way(addr >> LOG2_BLOCK_SIZE,set);
+  bool prehit = false;
+  if(block[set][way].prefetch == 1){
+    prehit = true;
+  }
+  if(cache_hit&&(!prehit)) {
+    DP(if (warmup_complete[cpu]){
+        cout << "[" << NAME << "] " << func << hex << " base_cl: " << (addr >> LOG2_BLOCK_SIZE);
+        cout << " pf_cl: " << (pf_addr >> LOG2_BLOCK_SIZE) << " ip: " << ip << " cache_hit: " << +cache_hit
+             << " type: " << +type << endl;
+    });
+    return metadata_in;
+  }
+  uint64_t pf_addr = ((addr >> LOG2_BLOCK_SIZE) + tracker.offset) << LOG2_BLOCK_SIZE;
+
+    DP(if (warmup_complete[cpu]){
+        cout << "[" << NAME << "] " << func << hex << " base_cl: " << (addr >> LOG2_BLOCK_SIZE);
+        cout << " pf_cl: " << (pf_addr >> LOG2_BLOCK_SIZE) << " ip: " << ip << " cache_hit: " << +cache_hit
+             << " type: " << +type << endl;
+    });
+    bool present = false;
+    for(int i=0;i<Q_LEN;i++) {
+      if(tracker.queue[i].valid==1 && tracker.queue[i].addr_bits == (addr>>LOG2_BLOCK_SIZE)) {
+        present = true;
+        break;
+      }
+    }
+    if(!present) {
+      for(int i=0;i<Q_LEN;i++) {
+        if(tracker.queue[i].valid==0) {
+          tracker.queue[i].addr_bits=(addr>>LOG2_BLOCK_SIZE);
+          tracker.queue[i].time = current_core_cycle[cpu];
+          tracker.queue[i].valid = 1;
+        }
+      }
+    }
+
+    tracker.update(cpu,addr);
+    if(tracker.stat==1 && tracker.offset!=0) {
+    	prefetch_line(ip, addr, pf_addr, FILL_L2, 0);
+    }
+    
+    return metadata_in;
+}
+
+uint32_t CACHE::l2c_prefetcher_cache_fill(uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_addr, uint32_t metadata_in)
+{
+  tracker.refresh(cpu);
+
+  if(prefetch != 1){
+	return metadata_in;
+  }
+  tracker.rr_right[tracker.right_last]= (((addr >> LOG2_BLOCK_SIZE) - tracker.offset));
+  tracker.right_last = (tracker.right_last + 1)%64;
+  return metadata_in;
+}
+
+
+void CACHE::l2c_prefetcher_final_stats()
+{
+    cout << "CPU " << cpu << " L2C PC-based best offset prefetcher final stats" << endl;
+}
